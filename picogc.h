@@ -48,11 +48,12 @@ namespace picogc {
   
   // external flags
   enum {
-    IS_ATOMIC = 1
+    IS_ATOMIC = 0x1,
+    IMMEDIATELY_TRACEABLE = 0x2,
+    MAY_TRIGGER_GC = 0x4
   };
 
   class gc;
-  class gc_root;
   class gc_object;
   
   template <typename value_type, size_t VALUES_PER_NODE = 2048> class _stack {
@@ -80,7 +81,9 @@ namespace picogc {
 	return --cur_;
       }
     };
-    _stack() : node_(new node), reserved_node_(NULL), top_(node_->values) {}
+    _stack() : node_(new node), reserved_node_(NULL), top_(node_->values) {
+      node_->prev = NULL;
+    }
     ~_stack() {
       delete reserved_node_;
       while (node_ != NULL) {
@@ -142,8 +145,12 @@ namespace picogc {
 
   struct config {
     size_t gc_interval_bytes_;
-    config(size_t gc_interval_bytes = 8192 * 1024)
-      : gc_interval_bytes_(gc_interval_bytes) {}
+    config() : gc_interval_bytes_(8 * 1024 * 1024) {}
+    size_t gc_interval_bytes() const { return gc_interval_bytes_; }
+    config& gc_interval_bytes(size_t v) {
+      gc_interval_bytes_ = v;
+      return *this;
+    }
   };
   
   struct gc_stats {
@@ -214,27 +221,24 @@ namespace picogc {
   
   class gc {
     friend class scope;
-    gc_root* roots_;
     scope* scope_;
     _stack<gc_object*> stack_;
     gc_object* obj_head_;
     _stack<gc_object*> pending_;
     size_t bytes_allocated_since_gc_;
-    config* config_;
+    config conf_;
     gc_emitter* emitter_;
   public:
-    gc(config* conf = &globals::default_config)
-      : roots_(NULL), scope_(NULL), stack_(), obj_head_(NULL), pending_(),
-	bytes_allocated_since_gc_(0), config_(conf),
+    gc(const config& conf = config())
+      : scope_(NULL), stack_(), obj_head_(NULL), pending_(),
+	bytes_allocated_since_gc_(0), conf_(conf),
 	emitter_(&globals::default_emitter)
     {}
     ~gc();
-    void* allocate(size_t sz, bool has_gc_members);
+    void* allocate(size_t sz, int flags);
     void trigger_gc();
     void may_trigger_gc();
     void mark(gc_object* obj);
-    void _register(gc_root* root);
-    void _unregister(gc_root* root);
     gc_object** _acquire_local_slot() {
       return stack_.push();
     }
@@ -245,24 +249,8 @@ namespace picogc {
       return globals::_top_scope;
     }
   protected:
-    void _setup_roots(gc_stats& stats);
-    void _mark(gc_stats& stats);
-    void _sweep(gc_stats& stats);
-  };
-  
-  class gc_root {
-    friend class gc;
-    gc_object* obj_;
-    gc_root* prev_;
-    gc_root* next_;
-  public:
-    gc_root(gc_object* obj) : obj_(obj) {
-      gc::top()->_register(this);
-    }
-    ~gc_root() {
-      gc::top()->_unregister(this);
-    }
-    gc_object* operator*() { return obj_; }
+    virtual void _mark(gc_stats& stats);
+    virtual void _sweep(gc_stats& stats);
   };
   
   class gc_object {
@@ -275,8 +263,11 @@ namespace picogc {
     virtual ~gc_object() {}
     virtual void gc_mark(picogc::gc* gc) {}
   public:
-    static void* operator new(size_t sz, int flags = 0);
+    bool gc_is_marked() const { return (next_ & _FLAG_MARKED) != 0; }
+    static void* operator new(size_t sz);
+    static void* operator new(size_t sz, int flags);
     static void operator delete(void* p);
+    static void operator delete(void* p, int flags);
   private:
     static void* operator new(size_t, void* buf) { return buf; }
   };
@@ -331,7 +322,6 @@ namespace picogc {
   
   inline gc::~gc()
   {
-    assert(roots_ == NULL);
     // free all objs
     for (gc_object* o = obj_head_; o != NULL; ) {
       gc_object* next = reinterpret_cast<gc_object*>(o->next_ & ~_FLAG_MASK);
@@ -341,28 +331,35 @@ namespace picogc {
     }
   }
   
-  inline void* gc::allocate(size_t sz, bool has_gc_members)
+  inline void* gc::allocate(size_t sz, int flags)
   {
     bytes_allocated_since_gc_ += sz;
+    if ((flags & MAY_TRIGGER_GC) != 0) {
+      may_trigger_gc();
+    }
     gc_object* p = static_cast<gc_object*>(::operator new(sz));
     // GC might walk through the object during construction
-    if (has_gc_members) {
-      memset(p, 0, sz);
+    if ((flags & IS_ATOMIC) == 0) {
+      memset(static_cast<void*>(p), 0, sz);
     }
     // register to GC list
-    scope* scope = scope_;
-    if (scope->new_head_ == NULL)
-      scope->new_tail_slot_ = &p->next_;
-    p->next_ = reinterpret_cast<intptr_t>(scope->new_head_)
-      | (has_gc_members ? _FLAG_HAS_GC_MEMBERS : 0);
-    scope->new_head_ = p;
+    if ((flags & IMMEDIATELY_TRACEABLE) != 0) {
+      p->next_ = reinterpret_cast<intptr_t>(obj_head_)
+          | ((flags & IS_ATOMIC) != 0 ? 0 : _FLAG_HAS_GC_MEMBERS);
+      obj_head_ = p;
+    } else {
+      scope* scope = scope_;
+      if (scope->new_head_ == NULL)
+        scope->new_tail_slot_ = &p->next_;
+      p->next_ = reinterpret_cast<intptr_t>(scope->new_head_)
+          | ((flags & IS_ATOMIC) != 0 ? 0 : _FLAG_HAS_GC_MEMBERS);
+      scope->new_head_ = p;
+    }
     return p;
   }
   
   inline void gc::_mark(gc_stats& stats)
   {
-    emitter_->mark_start(this);
-    
     // mark all the objects
     gc_object** slot;
     while ((slot = pending_.pop()) != NULL) {
@@ -370,14 +367,10 @@ namespace picogc {
       stats.slowly_marked++;
       (*slot)->gc_mark(this);
     }
-    
-    emitter_->mark_end(this);
   }
   
   inline void gc::_sweep(gc_stats& stats)
   {
-    emitter_->sweep_start(this);
-    
     // collect unmarked objects, as well as clearing the mark of live objects
     intptr_t* ref = reinterpret_cast<intptr_t*>(&obj_head_);
     for (gc_object* obj = obj_head_; obj != NULL; ) {
@@ -396,20 +389,6 @@ namespace picogc {
       obj = reinterpret_cast<gc_object*>(next & ~_FLAG_MASK);
     }
     *ref &= _FLAG_HAS_GC_MEMBERS;
-    
-    emitter_->sweep_end(this);
-  }
-  
-  inline void gc::_setup_roots(gc_stats& stats)
-  {
-    if (roots_ != NULL) {
-      gc_root* root = roots_;
-      do {
-	gc_object* obj = **root;
-	mark(obj);
-	stats.on_stack++;
-      } while ((root = root->next_) != roots_);
-    }
   }
   
   inline void gc::trigger_gc()
@@ -436,13 +415,15 @@ namespace picogc {
 	stats.on_stack++;
       }
     }
-    // setup root
-    _setup_roots(stats);
     
     // mark
+    emitter_->mark_start(this);
     _mark(stats);
+    emitter_->mark_end(this);
     // sweep
+    emitter_->sweep_start(this);
     _sweep(stats);
+    emitter_->sweep_end(this);
     
     // clear the marks in new (as well as count the number)
     for (scope* scope = scope_; scope != NULL; scope = scope->prev_) {
@@ -459,7 +440,7 @@ namespace picogc {
   
   inline void gc::may_trigger_gc()
   {
-    if (bytes_allocated_since_gc_ >= config_->gc_interval_bytes_) {
+    if (bytes_allocated_since_gc_ >= conf_.gc_interval_bytes()) {
       trigger_gc();
       bytes_allocated_since_gc_ = 0;
     }
@@ -479,35 +460,14 @@ namespace picogc {
       *pending_.push() = obj;
   }
   
-  inline void gc::_register(gc_root* root)
+  inline void* gc_object::operator new(size_t sz)
   {
-    if (roots_ == NULL) {
-      root->next_ = root->prev_ = root;
-      roots_ = root;
-    } else {
-      root->next_ = roots_;
-      root->prev_ = roots_->prev_;
-      root->prev_->next_ = root;
-      root->next_->prev_ = root;
-      roots_ = root;
-    }
+    return gc::top()->allocate(sz, 0);
   }
-  
-  inline void gc::_unregister(gc_root* root)
-  {
-    if (root->next_ != root) {
-      root->next_->prev_ = root->prev_;
-      root->prev_->next_ = root->next_;
-      if (root == roots_)
-	roots_ = root->next_;
-    } else {
-      roots_ = NULL;
-    }
-  }
-  
+
   inline void* gc_object::operator new(size_t sz, int flags)
   {
-    return gc::top()->allocate(sz, (flags & IS_ATOMIC) == 0);
+    return gc::top()->allocate(sz, flags);
   }
 
   // only called when an exception is raised within ctor
@@ -515,6 +475,11 @@ namespace picogc {
   {
     // vtbl should point to an empty dtor
     new (p) gc_object;
+  }
+
+  inline void gc_object::operator delete(void* p, int)
+  {
+    gc_object::operator delete(p);
   }
   
 }
